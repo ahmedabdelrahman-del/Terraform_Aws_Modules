@@ -1,8 +1,13 @@
-terraform output cognito_token_url
-terraform output m2m_client_id
-terraform output -raw m2m_client_secret
+# ===========================
+# 0) Confirm terraform outputs
+# ===========================
+terraform output token_broker_invoke_url
 terraform output resource_server_identifier
-##############################################
+
+# ================================
+# 1) Direct Cognito token test only
+#    (does NOT invoke Lambda)
+# ================================
 TOKEN_URL="$(terraform output -raw cognito_token_url)"
 CLIENT_ID="$(terraform output -raw m2m_client_id)"
 CLIENT_SECRET="$(terraform output -raw m2m_client_secret)"
@@ -13,7 +18,67 @@ curl -sS -X POST "$TOKEN_URL" \
   -u "${CLIENT_ID}:${CLIENT_SECRET}" \
   --data-urlencode "grant_type=client_credentials" \
   --data-urlencode "scope=${RS_ID}/tokens.read"
-  ########################################################(test with real email to get verification and hit cognito)
+
+# ==========================================
+# 2) Lambda invoke test via API Gateway (key)
+#    This WILL invoke Lambda and create cost
+# ==========================================
+BROKER_URL="$(terraform output -raw token_broker_invoke_url)"
+RS_ID="$(terraform output -raw resource_server_identifier)"
+
+# If enable_api_key=true (default in this repo), fetch key value from API Gateway.
+# Requires AWS CLI configured in the same account/region as deployment.
+API_KEY_NAME="cognito-throttle-lab-token-broker-api-key"
+API_KEY_VALUE="$(aws apigateway get-api-keys --include-values --query "items[?name=='${API_KEY_NAME}'] | [0].value" --output text)"
+
+# Guard: if key not found, stop here instead of sending invalid requests.
+if [ -z "$API_KEY_VALUE" ] || [ "$API_KEY_VALUE" = "None" ]; then
+  echo "API key not found. Check API_KEY_NAME or AWS profile/region."
+  exit 1
+fi
+
+curl -i -sS -X POST "$BROKER_URL" \
+  -H "x-api-key: ${API_KEY_VALUE}" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=${RS_ID}/tokens.read"
+
+# =====================================================
+# 3) Negative test (invalid scope) through Lambda broker
+# =====================================================
+curl -i -sS -X POST "$BROKER_URL" \
+  -H "x-api-key: ${API_KEY_VALUE}" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=${RS_ID}/admin"
+
+# ===========================================================
+# 4) Cost/load test: repeated Lambda invocations (sequential)
+# ===========================================================
+for i in $(seq 1 200); do
+  curl -sS -o /dev/null -w "req=${i} code=%{http_code} time=%{time_total}s\n" \
+    -X POST "$BROKER_URL" \
+    -H "x-api-key: ${API_KEY_VALUE}" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "scope=${RS_ID}/tokens.read"
+done
+
+# =====================================================================
+# 5) Burst test to trigger throttle/quota behavior (expect some 429 codes)
+# =====================================================================
+seq 1 20 | xargs -I{} -P 10 sh -c '
+  curl -sS -o /dev/null -w "parallel_req={} code=%{http_code}\n" \
+    -X POST "'$BROKER_URL'" \
+    -H "x-api-key: '$API_KEY_VALUE'" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "scope='${RS_ID}'/tokens.read"
+'
+
+# ========================================
+# 6) Optional Cognito sign-up flow (manual)
+# ========================================
 aws cognito-idp sign-up \
   --client-id <interactive_client_id> \
   --username your-real-email@example.com \
